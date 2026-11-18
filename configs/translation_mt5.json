@@ -1,0 +1,22 @@
+{
+  "text_encoder": "/scratch/lidowu91/Uni-Sign-Lido/checkpoints/mt5-base",
+  "data": "/scratch/lidowu91/SHuBERT/outputs/pose_mt5_youtubeasl_20261115/data",
+  "epochs": 20,
+  "batch_size": 24,
+  "eval_batch_size": 8,
+  "lr": 0.0002,
+  "encoder_lr_scale": 0.1,
+  "weight_decay": 0.0001,
+  "warmup_steps": 200,
+  "clip_grad": 1.0,
+  "label_smoothing": 0.2,
+  "max_frames": 256,
+  "max_text_length": 128,
+  "num_beams": 4,
+  "bf16": true,
+  "num_workers": 2,
+  "save_every": 1000,
+  "eval_every": 2000,
+  "log_every": 10,
+  "seed": 42
+}

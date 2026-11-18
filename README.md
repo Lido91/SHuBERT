@@ -17,6 +17,9 @@ We introduce SHuBERT (Sign Hidden-Unit BERT), a self-supervised contextual repre
 We provide installation and inference instructions in [QUICKSTART.md](QUICKSTART.md).
 
 ### Usage
+For the coordinate-only variant, including body/hand pose pretraining and feature
+extraction, see [POSE_ONLY.md](POSE_ONLY.md).
+
 #### 1. Preparing the data
 
 We describe how to prepare the datasets in [DATASETS.md](DATASETS.md).
