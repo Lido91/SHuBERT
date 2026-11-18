@@ -9,6 +9,7 @@ from fairseq.dataclass import FairseqDataclass
 from fairseq.tasks import FairseqTask, register_task
 
 from .dataset import PoseDataset
+from .packed_dataset import PackedPoseDataset
 
 
 @dataclass
@@ -25,8 +26,10 @@ class PosePretrainingConfig(FairseqDataclass):
 class PosePretrainingTask(FairseqTask):
     def load_dataset(self, split, task_cfg=None, **kwargs):
         cfg = task_cfg or self.cfg
-        self.datasets[split] = PoseDataset(
-            Path(cfg.data) / f"{split}.tsv", cfg.stream_names, cfg.stream_dims,
+        packed = Path(cfg.data) / f"{split}.pack.json"
+        dataset_class = PackedPoseDataset if packed.exists() else PoseDataset
+        self.datasets[split] = dataset_class(
+            packed if packed.exists() else Path(cfg.data) / f"{split}.tsv", cfg.stream_names, cfg.stream_dims,
             cfg.codebook_size, cfg.min_frames, cfg.max_frames, shuffle=(split == "train"),
         )
 
