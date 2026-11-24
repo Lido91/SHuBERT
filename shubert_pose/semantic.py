@@ -2,6 +2,7 @@
 
 Two symmetric InfoNCE losses are computed on clips that have a caption: a sentence-level loss on
 pooled features and a FILIP-style token-wise late-interaction loss on frame and text tokens.
+Projection heads and the handling of other processes' candidates follow SSVP-SLT.
 """
 
 import math
@@ -16,7 +17,9 @@ BLOCK_ELEMENTS = 2 ** 26
 
 
 def head(inputs, outputs):
-    return nn.Sequential(nn.Linear(inputs, outputs), nn.GELU(), nn.LayerNorm(outputs))
+    """SSVP-SLT's projection: two bias-free linear layers around a GELU."""
+    hidden = (inputs + outputs) // 2
+    return nn.Sequential(nn.Linear(inputs, hidden, bias=False), nn.GELU(), nn.Linear(hidden, outputs, bias=False))
 
 
 def process_group():
@@ -26,20 +29,27 @@ def process_group():
     return 0, 1
 
 
-def gather_counts(value, device):
-    """Every rank's integer `value`, ordered by rank."""
-    parts = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(process_group()[1])]
-    torch.distributed.all_gather(parts, torch.tensor([value], dtype=torch.long, device=device))
-    return torch.cat(parts)
+def gather_counts(values, device):
+    """[ranks, len(values)] integers: every rank's `values`, ordered by rank."""
+    local = torch.tensor(values, dtype=torch.long, device=device)
+    parts = [torch.zeros_like(local) for _ in range(process_group()[1])]
+    torch.distributed.all_gather(parts, local)
+    return torch.stack(parts)
 
 
-def gather_rows(local, counts):
-    """All ranks' rows, ordered by rank and without gradients; `counts` holds each rank's row count."""
+def gather_rows(local, counts, rank):
+    """All ranks' rows, ordered by rank; `counts` holds each rank's row count.
+
+    Only this rank's own rows keep their gradient. Summed over ranks, the gradients of a loss on the
+    gathered rows are the gradients of that loss computed in one process.
+    """
     padded = local.new_zeros((int(counts.max()),) + local.shape[1:])
     padded[:len(local)] = local.detach()
     parts = [torch.zeros_like(padded) for _ in counts]
     torch.distributed.all_gather(parts, padded)
-    return torch.cat([part[:count] for part, count in zip(parts, counts.tolist())])
+    rows = [part[:count] for part, count in zip(parts, counts.tolist())]
+    rows[rank] = local
+    return torch.cat(rows)
 
 
 def pad_tokens(tokens, mask, length):
@@ -83,12 +93,12 @@ def best_local_matches(text, text_mask, frames, frame_mask):
     return text_scores, frame_scores
 
 
-def symmetric_nce(first, second, all_first, all_second, offset, temperature):
-    """Mean symmetric InfoNCE of this process's pairs against every gathered candidate."""
-    labels = torch.arange(len(first), device=first.device) + offset
-    forward, backward = first @ all_second.t() / temperature, second @ all_first.t() / temperature
-    loss = 0.5 * (F.cross_entropy(forward, labels) + F.cross_entropy(backward, labels))
-    return loss, (forward.argmax(-1) == labels).float().mean()
+def symmetric_nce(scores, reverse_scores, temperature):
+    """Symmetric InfoNCE over [N, N] scores in both directions, with matching pairs on the diagonal."""
+    labels = torch.arange(len(scores), device=scores.device)
+    loss = 0.5 * (F.cross_entropy(scores / temperature, labels)
+                  + F.cross_entropy(reverse_scores / temperature, labels))
+    return loss, (scores.argmax(-1) == labels).float().mean()
 
 
 class SemanticAlignment(nn.Module):
@@ -134,8 +144,12 @@ class SemanticAlignment(nn.Module):
         weights = text_mask[..., None].float()
         return tokens, (tokens * weights).sum(1) / weights.sum(1).clamp_min(1)
 
-    def forward(self, x, padding_mask, text_ids, text_mask, gather=True):
-        """Per-process mean losses and logs. `text_mask` is True at caption tokens; rows without any are skipped."""
+    def forward(self, x, padding_mask, text_ids, text_mask, sample_size, gather=True):
+        """Losses over all captioned clips, in float32, and logs.
+
+        `text_mask` is True at caption tokens; clips without any are skipped. With `gather`, the losses
+        cover every process's clips. `sample_size` is the weight the criterion gives this process's loss.
+        """
         if text_ids is None or text_mask is None:
             raise ValueError("semantic alignment requires text_ids and text_mask; set task.captions")
         if text_ids.shape != text_mask.shape or text_mask.dtype != torch.bool or len(text_ids) != len(x):
@@ -143,16 +157,28 @@ class SemanticAlignment(nn.Module):
         paired = text_mask.any(1) & ~padding_mask.all(1)
         rank, world = process_group()
         distributed = gather and world > 1
-        # Every rank runs the same collectives, even with no captioned clip of its own.
-        counts = gather_counts(int(paired.sum()), x.device) if distributed else None
-        offset = int(counts[:rank].sum()) if distributed else 0
+        words_kept, frames_kept = (max(1, math.ceil(size * self.token_top_ratio))
+                                   for size in (text_ids.size(1), x.size(1)))
+        pairs, share = int(paired.sum()), 1.0
+        if distributed:
+            # Every rank runs the same collectives, even with no captioned clip of its own.
+            counts, sizes, word_sizes, frame_sizes = gather_counts(
+                [pairs, sample_size, words_kept, frames_kept], x.device).unbind(1)
+            pairs = int(counts.sum())
+            # Each rank holds a share of the gradient of one global loss. Scaled like this, the shares
+            # add up to that loss once after the criterion weights every rank by its own sample size.
+            share = float(sizes.sum()) / sample_size
         zero = x.float().sum() * 0
         losses = {"sent_nce_loss": zero}
         logs = {"sent_acc": 0.0, "caption_pairs": float(paired.sum())}
         if self.token_align:
             losses["token_nce_loss"], logs["token_acc"] = zero, 0.0
-        if not (int(counts.max()) if distributed else int(paired.sum())):
+        if not pairs:
             return losses, logs
+
+        def scaled(loss):
+            return zero + loss.detach() + (loss - loss.detach()) * share
+
         frames, valid = x[paired], ~padding_mask[paired]
         weights = valid[..., None].to(frames.dtype)
         pose = F.normalize(self.pose_sentence((frames * weights).sum(1) / weights.sum(1)).float(), dim=-1)
@@ -160,35 +186,28 @@ class SemanticAlignment(nn.Module):
             x.new_zeros(0, text_ids.size(1), self.text_dim, dtype=torch.float),
             x.new_zeros(0, self.text_dim, dtype=torch.float))
         sentence = F.normalize(self.text_sentence(sentence.to(frames.dtype)).float(), dim=-1)
-        all_pose, all_sentence = ((gather_rows(pose, counts), gather_rows(sentence, counts))
-                                  if distributed else (pose, sentence))
-        if paired.any():
-            losses["sent_nce_loss"], accuracy = symmetric_nce(pose, sentence, all_pose, all_sentence,
-                                                              offset, self.sent_tau)
-            logs["sent_acc"] = float(accuracy)
+        if distributed:
+            pose, sentence = gather_rows(pose, counts, rank), gather_rows(sentence, counts, rank)
+        scores = pose @ sentence.t()
+        loss, accuracy = symmetric_nce(scores, scores.t(), self.sent_tau)
+        losses["sent_nce_loss"], logs["sent_acc"] = scaled(loss), float(accuracy)
         if not self.token_align:
             return losses, logs
 
-        words = F.normalize(self.text_token(text_tokens.to(frames.dtype)).float(), dim=-1).to(frames.dtype)
-        steps = F.normalize(self.pose_token(frames).float(), dim=-1).to(frames.dtype)
+        words = F.normalize(self.text_token(text_tokens.to(frames.dtype)).float(), dim=-1)
+        steps = F.normalize(self.pose_token(frames).float(), dim=-1)
         word_mask = text_mask[paired]
         if self.token_top_ratio < 1:
             word_scores, step_scores = best_local_matches(words, word_mask, steps, valid)
             words, word_mask = keep_top_tokens(words, word_mask, word_scores, self.token_top_ratio)
             steps, valid = keep_top_tokens(steps, valid, step_scores, self.token_top_ratio)
-        all_words, all_word_mask, all_steps, all_valid = words, word_mask, steps, valid
         if distributed:
-            words, word_mask = pad_tokens(words, word_mask, int(gather_counts(words.size(1), x.device).max()))
-            steps, valid = pad_tokens(steps, valid, int(gather_counts(steps.size(1), x.device).max()))
-            all_words, all_steps = gather_rows(words.float(), counts).to(words.dtype), gather_rows(
-                steps.float(), counts).to(steps.dtype)
-            all_word_mask, all_valid = gather_rows(word_mask.long(), counts).bool(), gather_rows(
-                valid.long(), counts).bool()
-        if paired.any():
-            labels = torch.arange(len(words), device=x.device) + offset
-            text_to_pose = interaction(words, word_mask, all_steps, all_valid).float() / self.token_tau
-            pose_to_text = interaction(steps, valid, all_words, all_word_mask).float() / self.token_tau
-            losses["token_nce_loss"] = 0.5 * (F.cross_entropy(text_to_pose, labels)
-                                              + F.cross_entropy(pose_to_text, labels))
-            logs["token_acc"] = float((pose_to_text.argmax(-1) == labels).float().mean())
+            words, word_mask = pad_tokens(words, word_mask, int(word_sizes.max()))
+            steps, valid = pad_tokens(steps, valid, int(frame_sizes.max()))
+            words, steps = gather_rows(words, counts, rank), gather_rows(steps, counts, rank)
+            word_mask = gather_rows(word_mask.long(), counts, rank).bool()
+            valid = gather_rows(valid.long(), counts, rank).bool()
+        loss, accuracy = symmetric_nce(interaction(steps, valid, words, word_mask),
+                                       interaction(words, word_mask, steps, valid), self.token_tau)
+        losses["token_nce_loss"], logs["token_acc"] = scaled(loss), float(accuracy)
         return losses, logs

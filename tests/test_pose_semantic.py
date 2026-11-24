@@ -46,7 +46,10 @@ def tiny_text_model(root):
 
 def semantic_model(text_model, **kwargs):
     torch.manual_seed(3)
-    settings = dict(semantic=True, text_model=str(text_model), text_dim=12, align_dim=8, token_top_ratio=1.0)
+    # An even positional kernel, as in the training configs. With the odd kernel of the other tests,
+    # CPU gradients below the Transformer layers are unreliable in this PyTorch build, even without alignment.
+    settings = dict(semantic=True, text_model=str(text_model), text_dim=12, align_dim=8, token_top_ratio=1.0,
+                    conv_pos=4)
     settings.update(kwargs)
     return SHubertPoseModel(tiny_config(**settings))
 
@@ -80,12 +83,21 @@ def distributed_worker(rank, world, root, text_model):
     torch.distributed.init_process_group("gloo", init_method=f"file://{root / 'group'}", rank=rank, world_size=world)
     model = semantic_model(text_model).train()
     result = model(**torch.load(root / f"shard{rank}.pt"))
-    losses = {name: value[0] for name, value in result["losses"].items() if name != "kmeans_loss"}
-    sum(losses.values()).backward()
+    losses = {name: value for name, value in result["losses"].items() if name != "kmeans_loss"}
+    sum(value.sum() for value in losses.values()).backward()   # as the criterion sums them
+    torch.save(alignment_gradients(model), root / f"gradient{rank}.pt")
     (root / f"result{rank}.json").write_text(json.dumps({
-        "losses": {name: float(value) for name, value in losses.items()}, "logs": result["logs"],
-        "gradient": float(sum(p.grad.abs().sum() for p in model.semantic.parameters() if p.grad is not None))}))
+        "losses": {name: float(value[0]) for name, value in losses.items()}, "logs": result["logs"],
+        "sample_size": result["sample_size"]}))
     torch.distributed.destroy_process_group()
+
+
+def alignment_gradients(model):
+    """Gradients of an alignment head, a text head, and the shared pose encoder."""
+    layers = {"pose_sentence": model.semantic.pose_sentence[0], "text_token": model.semantic.text_token[2],
+              "encoder": model.encoder.layers[0].fc1, "projection": model.projections["body"]}
+    return {name: torch.zeros_like(layer.weight) if layer.weight.grad is None else layer.weight.grad.clone()
+            for name, layer in layers.items()}
 
 
 class SemanticAlignmentTests(unittest.TestCase):
@@ -113,6 +125,10 @@ class SemanticAlignmentTests(unittest.TestCase):
         self.assertEqual(result["logs"]["caption_pairs"], 3.0)
         (result["losses"]["sent_nce_loss"][0] + result["losses"]["token_nce_loss"][0]).backward()
         heads = model.semantic
+        # SSVP-SLT's projection: 16 -> (16 + 8) // 2 -> 8 without biases or normalization.
+        self.assertEqual({name: tuple(value.shape) for name, value in heads.pose_sentence.state_dict().items()},
+                         {"0.weight": (12, 16), "2.weight": (8, 12)})
+        self.assertTrue(all(value.dtype == torch.float32 for value in result["losses"].values()))
         for layer in (heads.pose_sentence[0], heads.text_sentence[0], heads.pose_token[0], heads.text_token[0],
                       model.projections["left_hand"], model.encoder.layers[0].fc1):
             self.assertGreater(layer.weight.grad.abs().sum().item(), 0)
@@ -229,27 +245,45 @@ class SemanticAlignmentTests(unittest.TestCase):
         for worker in workers:
             output, _ = worker.communicate(timeout=300)
             self.assertEqual(worker.returncode, 0, output)
-        return [json.loads((root / f"result{rank}.json").read_text()) for rank in range(len(shards))]
+        return [dict(json.loads((root / f"result{rank}.json").read_text()),
+                     gradient=torch.load(root / f"gradient{rank}.pt")) for rank in range(len(shards))]
 
-    def test_gathered_candidates_reproduce_the_single_process_loss(self):
+    def single_process(self, inputs):
+        model = semantic_model(self.text_model).train()
+        result = model(**inputs)
+        losses = {name: value for name, value in result["losses"].items() if name != "kmeans_loss"}
+        sum(value.sum() for value in losses.values()).backward()
+        return ({name: float(value[0]) for name, value in losses.items()}, result["sample_size"],
+                alignment_gradients(model))
+
+    def test_ranks_share_one_global_loss_and_its_gradient(self):
         inputs = batch(clips=5, uncaptioned=(2,))
-        whole = semantic_model(self.text_model).train()(**inputs)
+        losses, sample_size, gradient = self.single_process(inputs)
         results = self.distributed([rows(inputs, slice(0, 3)), rows(inputs, slice(3, 5))])
         self.assertEqual([r["logs"]["caption_pairs"] for r in results], [2.0, 2.0])
-        for name in ("sent_nce_loss", "token_nce_loss"):
-            # Each rank averages over its own anchors, against every rank's candidates.
-            combined = sum(r["losses"][name] * r["logs"]["caption_pairs"] for r in results) / 4
-            self.assertAlmostEqual(combined, float(whole["losses"][name][0]), places=4)
-        self.assertTrue(all(r["gradient"] > 0 for r in results))
+        self.assertEqual(sum(r["sample_size"] for r in results), sample_size)
+        self.assertNotEqual(results[0]["sample_size"], results[1]["sample_size"])
+        for result in results:   # every rank reports the loss over all ranks' clips
+            for name, value in losses.items():
+                self.assertAlmostEqual(result["losses"][name], value, places=4)
+        # Fairseq adds the ranks' gradients and divides by the total sample size.
+        for name, expected in gradient.items():
+            self.assertGreater(expected.abs().sum().item(), 0)
+            torch.testing.assert_close(sum(r["gradient"][name] for r in results) / sample_size,
+                                       expected / sample_size, rtol=1e-3, atol=1e-6)
 
-    def test_a_rank_without_captions_still_supplies_no_candidates(self):
+    def test_a_rank_without_captions_reports_the_loss_without_gradients(self):
         inputs = batch(clips=4, uncaptioned=(2, 3))
-        alone = semantic_model(self.text_model).train()(**rows(inputs, slice(0, 2)))
+        losses, sample_size, gradient = self.single_process(rows(inputs, slice(0, 2)))
         results = self.distributed([rows(inputs, slice(0, 2)), rows(inputs, slice(2, 4))])
-        self.assertEqual(results[1]["losses"], {"sent_nce_loss": 0.0, "token_nce_loss": 0.0})
-        self.assertEqual(results[1]["gradient"], 0)
-        for name in ("sent_nce_loss", "token_nce_loss"):
-            self.assertAlmostEqual(results[0]["losses"][name], float(alone["losses"][name][0]), places=4)
+        for result in results:
+            for name, value in losses.items():
+                self.assertAlmostEqual(result["losses"][name], value, places=4)
+        total = sum(r["sample_size"] for r in results)
+        for name, expected in gradient.items():
+            self.assertEqual(results[1]["gradient"][name].abs().sum().item(), 0)
+            torch.testing.assert_close(results[0]["gradient"][name] / total, expected / sample_size,
+                                       rtol=1e-3, atol=1e-6)
 
     def test_evaluation_does_not_gather(self):
         model, inputs = semantic_model(self.text_model).eval(), batch()
@@ -268,7 +302,7 @@ class SemanticAlignmentTests(unittest.TestCase):
     def test_initialization_requires_exactly_the_backbone(self):
         root = Path(tempfile.mkdtemp(dir=self.temp.name))
         torch.manual_seed(8)
-        pretrained = SHubertPoseModel(tiny_config())
+        pretrained = SHubertPoseModel(tiny_config(conv_pos=4))
         self.checkpoint(pretrained, root / "masked.pt")
         model = semantic_model(self.text_model)
         model.initialize_from(root / "masked.pt")
@@ -288,7 +322,7 @@ class SemanticAlignmentTests(unittest.TestCase):
         self.assertEqual(saved["cfg"]["task"]["captions"], "")
         self.assertTrue(saved["export"]["removed"])
         self.assertFalse(any(name.startswith("semantic.") for name in saved["model"]))
-        plain = SHubertPoseModel(tiny_config())
+        plain = SHubertPoseModel(tiny_config(conv_pos=4))
         plain.load_state_dict(saved["model"], strict=True)
         inputs = batch()
         torch.testing.assert_close(self.features(plain.eval(), inputs), self.features(model.eval(), inputs))

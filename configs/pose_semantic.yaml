@@ -2,7 +2,7 @@
 # Second stage: masked cluster prediction plus SeRV-style alignment to a frozen T5 encoder.
 # Starts from a masked-prediction checkpoint (model.init_checkpoint) and needs prepared captions.
 common:
-  fp16: true
+  fp16: false
   log_format: json
   log_interval: 20
   seed: 1
@@ -75,7 +75,7 @@ model:
   semantic: true
   text_model: ???
   text_dim: 768
-  align_dim: 512
+  align_dim: 768
   sent_tau: 0.07
   token_align: true
   token_tau: 0.07

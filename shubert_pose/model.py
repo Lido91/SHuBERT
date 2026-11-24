@@ -27,7 +27,7 @@ class SHubertPoseConfig(Wav2Vec2Config):
     semantic: bool = False
     text_model: str = ""
     text_dim: int = 768
-    align_dim: int = 512
+    align_dim: int = 768
     sent_tau: float = 0.07
     token_align: bool = True
     token_tau: float = 0.07
@@ -148,9 +148,10 @@ class SHubertPoseModel(BaseFairseqModel):
         result = {"losses": {"kmeans_loss": losses}, "sample_size": losses.numel(), "masked_positions": selected}
         if self.semantic is not None:
             # Collectives across processes are only safe in training, where every rank runs the same steps.
-            aligned, result["logs"] = self.semantic(x, padding_mask, text_ids, text_mask, gather=self.training)
+            aligned, result["logs"] = self.semantic(x, padding_mask, text_ids, text_mask, losses.numel(),
+                                                    gather=self.training)
             # The criterion sums element-wise losses and divides by sample_size: one copy per cluster loss
-            # element keeps each alignment term a per-process mean, weighted like the cluster loss.
+            # element weighs each alignment term like the mean cluster loss.
             result["losses"].update({name: value.expand(losses.numel()) for name, value in aligned.items()})
         return result
 
