@@ -26,7 +26,9 @@ and use this checkout when installing Fairseq.
 The coordinate-only variant lives in `shubert_pose/`, with `configs/pose.yaml`,
 `scripts/prepare_pose.py`, `train_pose.sh`, and `features/pose_inference.py`.
 See `POSE_ONLY.md` for its separate manifest and checkpoint contracts and
-`tests/test_pose.py` for focused tests. It supports configurable coordinate
+`tests/test_pose.py` for focused tests. Its optional second stage adds SeRV-style
+caption alignment losses: `shubert_pose/semantic.py`, `configs/pose_semantic.yaml`,
+`scripts/prepare_pose_captions.py`, and `tests/test_pose_semantic.py`. It supports configurable coordinate
 streams and does not use the original four-stream data loader.
 
 ## Environments and setup

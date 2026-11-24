@@ -11,6 +11,6 @@ pose_output="$(realpath -m -- "$2")"
 shift 2
 export PYTHONPATH="$repo_root/fairseq:$repo_root${PYTHONPATH:+:$PYTHONPATH}"
 exec python -m fairseq_cli.hydra_train \
-    --config-dir "$repo_root/configs" --config-name pose \
+    --config-dir "$repo_root/configs" --config-name "${POSE_CONFIG:-pose}" \
     "common.user_dir=$repo_root/shubert_pose" \
     "task.data=$pose_data" "checkpoint.save_dir=$pose_output" "$@"

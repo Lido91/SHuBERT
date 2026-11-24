@@ -1,6 +1,7 @@
 """Coordinate projections, masked temporal context, and one cluster head per stream."""
 
 from dataclasses import dataclass, field
+import logging
 from typing import List
 
 import torch
@@ -9,6 +10,8 @@ from torch.nn import functional as F
 
 from fairseq.models import BaseFairseqModel, register_model
 from fairseq.models.wav2vec.wav2vec2 import TransformerEncoder, Wav2Vec2Config
+
+from .semantic import SEMANTIC_PREFIX, SemanticAlignment
 
 
 @dataclass
@@ -20,6 +23,17 @@ class SHubertPoseConfig(Wav2Vec2Config):
     mask_strategy: str = "random"
     mask_prob: float = 0.8
     mask_length: int = 3
+    # SeRV-style alignment to a frozen T5 encoder, added to the cluster loss for captioned clips.
+    semantic: bool = False
+    text_model: str = ""
+    text_dim: int = 768
+    align_dim: int = 512
+    sent_tau: float = 0.07
+    token_align: bool = True
+    token_tau: float = 0.07
+    token_top_ratio: float = 0.25
+    semantic_gather: bool = True
+    init_checkpoint: str = ""
 
 
 @register_model("shubert_pose", dataclass=SHubertPoseConfig)
@@ -44,10 +58,22 @@ class SHubertPoseModel(BaseFairseqModel):
         self.dropout_input = nn.Dropout(cfg.dropout_input)
         self.encoder = TransformerEncoder(cfg)
         self.heads = nn.ModuleDict({s: nn.Linear(cfg.encoder_embed_dim, cfg.codebook_size) for s in self.streams})
+        self.semantic = SemanticAlignment(cfg) if cfg.semantic else None
 
     @classmethod
     def build_model(cls, cfg, task=None):
         return cls(cfg)
+
+    def initialize_from(self, path):
+        """Start from masked-prediction weights; only the semantic heads may be absent from them."""
+        saved = torch.load(path, map_location="cpu", weights_only=False)["model"]
+        saved = {name: value for name, value in saved.items() if not name.startswith(SEMANTIC_PREFIX)}
+        expected = {name for name in self.state_dict() if not name.startswith(SEMANTIC_PREFIX)}
+        if set(saved) != expected:
+            raise ValueError(f"{path}: backbone keys differ: missing={sorted(expected - set(saved))}, "
+                             f"unexpected={sorted(set(saved) - expected)}")
+        self.load_state_dict(saved, strict=False)
+        logging.getLogger(__name__).info("initialized %d backbone tensors from %s", len(saved), path)
 
     def _span_mask(self, size, device):
         """Mask spans over `size` consecutive positions, always leaving one observed when size > 1."""
@@ -79,7 +105,8 @@ class SHubertPoseModel(BaseFairseqModel):
                     mask[i, :length, channel] = self._span_mask(length, padding.device)
         return mask
 
-    def forward(self, source, padding_mask=None, labels=None, mask=True, features_only=False, mask_indices=None, layer=None):
+    def forward(self, source, padding_mask=None, labels=None, mask=True, features_only=False, mask_indices=None,
+                layer=None, text_ids=None, text_mask=None):
         if set(source) != set(self.streams):
             raise ValueError(f"expected coordinate streams {self.streams}, got {list(source)}")
         first = source[self.streams[0]]
@@ -118,7 +145,14 @@ class SHubertPoseModel(BaseFairseqModel):
             chosen = selected[:, :, i]
             losses.append(F.cross_entropy(self.heads[stream](x[chosen]).float(), labels[stream][chosen], reduction="none"))
         losses = torch.cat(losses)
-        return {"losses": {"kmeans_loss": losses}, "sample_size": losses.numel(), "masked_positions": selected}
+        result = {"losses": {"kmeans_loss": losses}, "sample_size": losses.numel(), "masked_positions": selected}
+        if self.semantic is not None:
+            # Collectives across processes are only safe in training, where every rank runs the same steps.
+            aligned, result["logs"] = self.semantic(x, padding_mask, text_ids, text_mask, gather=self.training)
+            # The criterion sums element-wise losses and divides by sample_size: one copy per cluster loss
+            # element keeps each alignment term a per-process mean, weighted like the cluster loss.
+            result["losses"].update({name: value.expand(losses.numel()) for name, value in aligned.items()})
+        return result
 
     def extract_features(self, source, padding_mask=None, mask=False, layer=None):
         return self.forward(source, padding_mask=padding_mask, mask=mask, features_only=True, layer=layer)

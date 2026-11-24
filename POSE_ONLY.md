@@ -183,6 +183,76 @@ For a single 133D input array, for example, name that stream `pose` and use
 `'task.stream_names=[pose]' 'task.stream_dims=[133]'`. This does not perform a
 representation conversion. Codebooks must be fitted on the same representation.
 
+## Semantic alignment (second stage)
+
+Masked cluster prediction alone uses per-frame coordinate clusters as targets, so nothing asks clips with
+the same meaning to have similar features. `shubert_pose/semantic.py` adds the two alignment losses of
+SeRV (arXiv 2609.05742) for clips that have a caption, on top of the unchanged cluster loss:
+
+- `sent_nce_loss`: symmetric InfoNCE between the mean of a clip's valid frame features and the mean of
+  its caption's text-encoder tokens.
+- `token_nce_loss`: FILIP-style late interaction. Each caption token takes its best-matching frame and
+  each frame its best-matching caption token; the averaged scores give a second symmetric InfoNCE.
+
+Both use the same masked forward pass as the cluster loss. The text encoder is a frozen T5 or mT5
+encoder; pose and text features pass through separate `Linear -> GELU -> LayerNorm` heads of width
+`model.align_dim` and are L2-normalized. Temperatures are fixed (`sent_tau`, `token_tau`, default 0.07).
+Before the token loss, only the `token_top_ratio` (default 0.25) best-matching caption tokens and frames
+of each clip are kept, which makes the token similarity tensor about 16 times smaller.
+`model.token_align=false` keeps only the sentence loss.
+
+In distributed training each rank scores its own clips against the candidates of all ranks, which are
+gathered without gradients, as in SeRV. Validation uses each rank's own candidates only. Clips without a
+caption contribute only to the cluster loss. The frozen text encoder is not part of the checkpoint.
+
+The loss weights in `configs/pose_semantic.yaml` (cluster 1.0, sentence 0.5, token 0.5) are an untuned
+starting point: SeRV's weights (0.005 and 0.001--0.005) were chosen against a reconstruction loss and do
+not carry over. Duplicate captions within a batch act as negatives of one another.
+
+Prepare captions for the packed clips, then start from a masked-prediction checkpoint:
+
+```bash
+python scripts/prepare_pose_captions.py \
+  --records /path/to/train.records.jsonl --pack data/pose/train.pack.json \
+  --text-model google/flan-t5-base --output data/pose_captions
+
+POSE_CONFIG=pose_semantic bash train_pose.sh data/pose outputs/pose_semantic/ckpt \
+  task.captions=data/pose_captions/captions.json \
+  model.text_model=google/flan-t5-base \
+  model.init_checkpoint=outputs/pose/ckpt/checkpoint_last.pt
+```
+
+`--records` takes JSON lines with `pack_index` and `text`, such as the `train.records.jsonl` written by
+`scripts/prepare_pose_translation.py`; `pack_index` must index the clips of `--pack`, which the loader
+checks through the clip-offset hash. Captions are truncated to `--max-tokens` (default 40, as in SeRV).
+`model.init_checkpoint` must contain exactly the backbone weights; only the alignment heads start from
+random values. Semantic alignment requires packed data. An out-of-memory error on one rank will stall
+the other ranks instead of being skipped, because the gathers are collective.
+
+`scripts/run_youtubeasl_pose_semantic.sh` is the launcher for the formal YouTubeASL pack. It requires
+`POSE_SEMANTIC_ROOT` (a new output directory) and `POSE_TEXT_MODEL`, and by default continues from the
+150-epoch run's `checkpoint_last.pt` for `POSE_SEMANTIC_EPOCHS=50` epochs at a peak learning rate of
+1e-4. It has not been run.
+
+The existing downstream tools load a second-stage checkpoint strictly without the text encoder. To
+drop the alignment heads as well, so that the checkpoint has the same keys as a first-stage one:
+
+```bash
+python scripts/export_pose_backbone.py \
+  --checkpoint outputs/pose_semantic/ckpt/checkpoint_last.pt --output outputs/pose_semantic/backbone.pt
+```
+
+On 2026-11-24, on a development machine without the YouTubeASL data, the 15 tests in
+`tests/test_pose_semantic.py` passed and the other 53 focused tests had no failures (two skipped for
+missing cluster assets), with Python 3.9, PyTorch 2.1.1, Hydra 1.0.7, and OmegaConf 2.0.6. The tests compare both losses
+with a direct computation, check gradients, padding and uncaptioned clips, and check that two CPU
+processes with gathered candidates reproduce the single-process losses. On synthetic packed data with
+the real `google/flan-t5-base`, a reduced two-layer model completed first-stage training, second-stage
+initialization, two-GPU training with gradient accumulation and validation over five epochs, checkpoint
+resumption, and backbone export with identical features. The default 12-layer model ran 12 updates at
+15,000 frames per device with no measurable change in free GPU memory. Training on real captions, loss
+weights, and any downstream effect are untested.
+
 ## YouTubeASL trial on the current cluster
 
 The machine-specific launchers in `scripts/pose_runtime.sh` and

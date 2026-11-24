@@ -78,11 +78,20 @@ class PoseDataset(FairseqDataset):
             for stream in self.streams:
                 source[stream][i, :length] = sample["source"][stream][start:start + length]
                 labels[stream][i, :length] = sample["labels"][stream][start:start + length]
+        net_input = {"source": source, "labels": labels, "padding_mask": padding}
+        if "text" in samples[0]:
+            # Clips without a caption keep an all-False row and are skipped by the alignment losses.
+            text = torch.zeros(len(samples), max(1, max(len(s["text"]) for s in samples)), dtype=torch.long)
+            text_mask = torch.zeros_like(text, dtype=torch.bool)
+            for i, sample in enumerate(samples):
+                text[i, :len(sample["text"])] = sample["text"]
+                text_mask[i, :len(sample["text"])] = True
+            net_input.update(text_ids=text, text_mask=text_mask)
         return {
             "id": torch.tensor([s["id"] for s in samples]),
             "nsentences": len(samples),
             "ntokens": sum(lengths),
-            "net_input": {"source": source, "labels": labels, "padding_mask": padding},
+            "net_input": net_input,
         }
 
     def num_tokens(self, index):

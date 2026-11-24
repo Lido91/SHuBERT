@@ -18,7 +18,8 @@ class PackedPoseDataset(FairseqDataset):
     size = PoseDataset.size
     ordered_indices = PoseDataset.ordered_indices
 
-    def __init__(self, manifest, streams, dimensions, codebook_size, min_frames=2, max_frames=256, shuffle=True):
+    def __init__(self, manifest, streams, dimensions, codebook_size, min_frames=2, max_frames=256, shuffle=True,
+                 captions=None):
         super().__init__()
         self.manifest = Path(manifest)
         self.metadata = json.loads(self.manifest.read_text())
@@ -46,6 +47,17 @@ class PackedPoseDataset(FairseqDataset):
         if not len(self.indices):
             raise ValueError("no packed clips meet min_frames")
         self.max_frames, self.shuffle = max_frames, shuffle
+        self.captions = json.loads(Path(captions).read_text()) if captions else None
+        if self.captions is not None:
+            if self.captions.get("format") != "shubert-pose-captions-v1":
+                raise ValueError("unsupported caption pack format")
+            # Captions are indexed by pack clip, so they must come from exactly these clip offsets.
+            if self.captions["pack_offsets_sha256"] != self.metadata["offsets_sha256"]:
+                raise ValueError("captions were prepared for different packed clips")
+            for key in ("tokens", "offsets"):
+                path = Path(self.captions[key])
+                if hashlib.sha256(path.read_bytes()).hexdigest() != self.captions[f"{key}_sha256"]:
+                    raise ValueError(f"caption {key} changed; prepare captions again")
         self._open_arrays()
 
     def _open_arrays(self):
@@ -57,6 +69,12 @@ class PackedPoseDataset(FairseqDataset):
         for stream, dimension in zip(self.streams, self.dimensions):
             if self.features[stream].shape != (total, dimension) or self.labels[stream].shape != (total,):
                 raise ValueError(f"{stream}: packed array shape mismatch")
+        if self.captions is not None:
+            self.text = np.load(self.captions["tokens"], mmap_mode="r", allow_pickle=False)
+            self.text_offsets = np.load(self.captions["offsets"], mmap_mode="r", allow_pickle=False)
+            if (self.text_offsets.shape != self.offsets.shape or self.text_offsets[0] != 0
+                    or self.text_offsets[-1] != len(self.text) or self.text.ndim != 1):
+                raise ValueError("caption arrays do not match the packed clips")
 
     def __len__(self):
         return len(self.indices)
@@ -75,11 +93,15 @@ class PackedPoseDataset(FairseqDataset):
                     or (targets >= self.metadata["codebook_size"]).any()):
                 raise ValueError(f"invalid packed coordinates or labels for clip {clip}, {stream}")
             source[stream], labels[stream] = torch.from_numpy(coordinates), torch.from_numpy(targets)
-        return {"id": index, "source": source, "labels": labels}
+        sample = {"id": index, "source": source, "labels": labels}
+        if self.captions is not None:
+            first, last = map(int, self.text_offsets[clip:clip + 2])
+            sample["text"] = torch.from_numpy(np.array(self.text[first:last], dtype=np.int64, copy=True))
+        return sample
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        for key in ("features", "labels", "offsets"):
+        for key in ("features", "labels", "offsets", "text", "text_offsets"):
             state.pop(key, None)
         return state
 
